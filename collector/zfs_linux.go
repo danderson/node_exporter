@@ -11,10 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build !nozfs
+
 package collector
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,6 +41,62 @@ const (
 	kstatDataUlong  = "6"
 	kstatDataString = "7"
 )
+
+func init() {
+	registerCollector("zfs", defaultEnabled, NewZFSCollector)
+}
+
+var errZFSNotAvailable = errors.New("ZFS / ZFS statistics are not available")
+
+type zfsSysctl string
+
+func (s zfsSysctl) metricName() string {
+	parts := strings.Split(string(s), ".")
+	return strings.Replace(parts[len(parts)-1], "-", "_", -1)
+}
+
+type zfsCollector struct {
+	linuxProcpathBase string
+	linuxZpoolIoPath  string
+	linuxPathMap      map[string]string
+}
+
+// NewZFSCollector returns a new Collector exposing ZFS statistics.
+func NewZFSCollector() (Collector, error) {
+	return &zfsCollector{
+		linuxProcpathBase: "spl/kstat/zfs",
+		linuxZpoolIoPath:  "/*/io",
+		linuxPathMap: map[string]string{
+			"zfs_abd":         "abdstats",
+			"zfs_arc":         "arcstats",
+			"zfs_dbuf":        "dbuf_stats",
+			"zfs_dmu_tx":      "dmu_tx",
+			"zfs_dnode":       "dnodestats",
+			"zfs_fm":          "fm",
+			"zfs_vdev_cache":  "vdev_cache_stats", // vdev_cache is deprecated
+			"zfs_vdev_mirror": "vdev_mirror_stats",
+			"zfs_xuio":        "xuio_stats", // no known consumers of the XUIO interface on Linux exist
+			"zfs_zfetch":      "zfetchstats",
+			"zfs_zil":         "zil",
+		},
+	}, nil
+}
+
+func (c *zfsCollector) Update(ch chan<- prometheus.Metric) error {
+	for subsystem := range c.linuxPathMap {
+		if err := c.updateZfsStats(subsystem, ch); err != nil {
+			if err == errZFSNotAvailable {
+				log.Debug(err)
+				// ZFS /proc files are added as new features to ZFS arrive, it is ok to continue
+				continue
+			}
+			return err
+		}
+	}
+
+	// Pool stats
+	return c.updatePoolStats(ch)
+}
 
 func (c *zfsCollector) openProcFile(path string) (*os.File, error) {
 	file, err := os.Open(procFilePath(path))
@@ -91,6 +150,37 @@ func (c *zfsCollector) updatePoolStats(ch chan<- prometheus.Metric) error {
 	}
 
 	return nil
+}
+
+func (c *zfsCollector) constSysctlMetric(subsystem string, sysctl zfsSysctl, value uint64) prometheus.Metric {
+	metricName := sysctl.metricName()
+
+	return prometheus.MustNewConstMetric(
+		prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, subsystem, metricName),
+			string(sysctl),
+			nil,
+			nil,
+		),
+		prometheus.UntypedValue,
+		float64(value),
+	)
+}
+
+func (c *zfsCollector) constPoolMetric(poolName string, sysctl zfsSysctl, value uint64) prometheus.Metric {
+	metricName := sysctl.metricName()
+
+	return prometheus.MustNewConstMetric(
+		prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "zfs_zpool", metricName),
+			string(sysctl),
+			[]string{"zpool"},
+			nil,
+		),
+		prometheus.UntypedValue,
+		float64(value),
+		poolName,
+	)
 }
 
 func (c *zfsCollector) parseProcfsFile(reader io.Reader, fmtExt string, handler func(zfsSysctl, uint64)) error {
